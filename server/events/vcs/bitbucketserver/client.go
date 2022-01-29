@@ -1,11 +1,16 @@
 package bitbucketserver
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
+	"mime/multipart"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"regexp"
 	"strings"
@@ -32,6 +37,21 @@ type Client struct {
 type DeleteSourceBranch struct {
 	Name   string `json:"name"`
 	DryRun bool   `json:"dryRun"`
+}
+
+type Attachment struct {
+	Attachments []struct {
+		ID    string `json:"id"`
+		URL   string `json:"url"`
+		Links struct {
+			Self struct {
+				Href string `json:"href"`
+			} `json:"self"`
+			Attachment struct {
+				Href string `json:"href"`
+			} `json:"attachment"`
+		} `json:"links"`
+	} `json:"attachments"`
 }
 
 // NewClient builds a bitbucket cloud client. Returns an error if the baseURL is
@@ -137,11 +157,78 @@ func (b *Client) CreateComment(repo models.Repo, pullNum int, comment string, co
 	sepEnd := "\n```\n**Warning**: Output length greater than max comment size. Continued in next comment."
 	sepStart := "Continued from previous comment.\n```diff\n"
 	comments := common.SplitComment(comment, maxCommentLength, sepEnd, sepStart)
-	for _, c := range comments {
-		if err := b.postComment(repo, pullNum, c); err != nil {
-			return err
+
+	myReader := strings.NewReader(comment)
+	scanner := bufio.NewScanner(myReader)
+	scanner.Split(bufio.ScanLines)
+	var txtlines []string
+	var tfsummary []string
+
+	for scanner.Scan() {
+		txtlines = append(txtlines, scanner.Text())
+	}
+
+	tfsummary = append(tfsummary, "DESTROYED")
+	for _, value := range txtlines {
+		if strings.Contains(value, "destroyed") {
+			tfsummary = append(tfsummary, value)
 		}
 	}
+
+	tfsummary = append(tfsummary, "CREATED")
+	for _, value := range txtlines {
+		if strings.Contains(value, "created") {
+			tfsummary = append(tfsummary, value)
+		}
+	}
+
+	tfsummary = append(tfsummary, "REPLACED")
+	for _, value := range txtlines {
+		if strings.Contains(value, "replaced") {
+			tfsummary = append(tfsummary, value)
+		}
+	}
+
+	tfsummary = append(tfsummary, "UPDATED")
+	for _, value := range txtlines {
+		if strings.Contains(value, "updated") {
+			tfsummary = append(tfsummary, value)
+		}
+	}
+
+	var concatenatestrings strings.Builder
+
+	for _, value := range tfsummary {
+		concatenatestrings.WriteString(value)
+		concatenatestrings.WriteString("\n")
+	}
+
+	fmt.Println(concatenatestrings.String())
+
+	var attachmentId string
+	var err error
+
+	if err := b.postComment(repo, pullNum, concatenatestrings.String()); err != nil {
+		return err
+	}
+
+	if len(comments) > 1 {
+		if attachmentId, err = b.postCommentMultiPartUpload(repo, pullNum, comment, "tfplan.txt"); err != nil {
+			return err
+		}
+
+		if err := b.attachFileToComment(repo, "POST", pullNum, attachmentId, "tfplan.txt"); err != nil {
+			return err
+		}
+
+	} else {
+		for _, c := range comments {
+			if err := b.postComment(repo, pullNum, c); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -162,6 +249,22 @@ func (b *Client) postComment(repo models.Repo, pullNum int, comment string) erro
 	path := fmt.Sprintf("%s/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments", b.BaseURL, projectKey, repo.Name, pullNum)
 	_, err = b.makeRequest("POST", path, bytes.NewBuffer(bodyBytes))
 	return err
+}
+
+// postComment actually posts the comment. It's a helper for CreateComment().
+func (b *Client) postCommentMultiPartUpload(repo models.Repo, pullNum int, comment string, fileName string) (string, error) {
+	var responsebody string
+
+	projectKey, err := b.GetProjectKey(repo.Name, repo.SanitizedCloneURL)
+	if err != nil {
+		return "", err
+	}
+
+	path := fmt.Sprintf("%s/projects/%s/repos/%s/attachments", b.BaseURL, projectKey, repo.Name)
+	responsebody, err = b.makeRequestMultiPart("POST", path, comment, fileName)
+	log.Println(responsebody)
+
+	return responsebody, err
 }
 
 // PullIsApproved returns true if the merge request was approved.
@@ -310,6 +413,24 @@ func (b *Client) prepRequest(method string, path string, body io.Reader) (*http.
 	return req, nil
 }
 
+// prepRequest adds auth and necessary headers.
+func (b *Client) prepRequestMultiPart(method string, path string, body io.Reader, contentType string) (*http.Request, error) {
+	req, err := http.NewRequest(method, path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(b.Username, b.Password)
+	if body != nil {
+		//req.Header.Add("Content-Type", "multipart/form-data")
+		req.Header.Add("Content-Type", contentType)
+
+	}
+	// Add this header to disable CSRF checks.
+	// See https://confluence.atlassian.com/cloudkb/xsrf-check-failed-when-calling-cloud-apis-826874382.html
+	req.Header.Add("X-Atlassian-Token", "no-check")
+	return req, nil
+}
+
 func (b *Client) makeRequest(method string, path string, reqBody io.Reader) ([]byte, error) {
 	req, err := b.prepRequest(method, path, reqBody)
 	if err != nil {
@@ -331,6 +452,76 @@ func (b *Client) makeRequest(method string, path string, reqBody io.Reader) ([]b
 		return nil, errors.Wrapf(err, "reading response from request %q", requestStr)
 	}
 	return respBody, nil
+}
+
+func (b *Client) makeRequestMultiPart(method string, path string, comments string, fileName string) (string, error) {
+
+	bodyMulti := &bytes.Buffer{}
+	attach := &Attachment{}
+	writer := multipart.NewWriter(bodyMulti)
+	part, _ := writer.CreateFormFile("files", fileName)
+
+	part.Write([]byte(comments))
+	writer.Close()
+
+	req, err := http.NewRequest(method, path, bytes.NewReader(bodyMulti.Bytes()))
+	if err != nil {
+		return "", err
+	}
+
+	req, err = b.prepRequestMultiPart(method, path, bodyMulti, writer.FormDataContentType())
+	if err != nil {
+		return "", errors.Wrap(err, "constructing request")
+	}
+
+	resp, err := b.HTTPClient.Do(req)
+
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close() // nolint: errcheck
+	requestStr := fmt.Sprintf("%s %s", method, path)
+
+	data, err := httputil.DumpResponse(resp, true)
+	if err != nil {
+		log.Printf("Failed to dump response")
+	} else {
+		log.Printf(string(data))
+	}
+
+	data, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return "", errors.Wrapf(err, "reading response from request %q", requestStr)
+	}
+	resp.Body = ioutil.NopCloser(bytes.NewBuffer(data))
+	if err != nil {
+		return "", err
+	}
+
+	if err := json.Unmarshal(data, attach); err != nil {
+		return "", fmt.Errorf(" %s", err)
+	}
+
+	return attach.Attachments[0].Links.Attachment.Href, nil
+}
+
+// Attach uploaded file to PR comment
+func (b *Client) attachFileToComment(repo models.Repo, method string, pullNum int, attachmentId string, fileName string) error {
+
+	comment := fmt.Sprintf("From Atlantis  - [%s](%s)", fileName, attachmentId)
+
+	bodyBytes, err := json.Marshal(map[string]string{"text": comment})
+	if err != nil {
+		return errors.Wrap(err, "json encoding")
+	}
+	projectKey, err := b.GetProjectKey(repo.Name, repo.SanitizedCloneURL)
+	if err != nil {
+		return err
+	}
+	//%s/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments
+	path := fmt.Sprintf("%s/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments", b.BaseURL, projectKey, repo.Name, pullNum)
+	_, err = b.makeRequest("POST", path, bytes.NewBuffer(bodyBytes))
+	return err
 }
 
 // GetTeamNamesForUser returns the names of the teams or groups that the user belongs to (in the organization the repository belongs to).
